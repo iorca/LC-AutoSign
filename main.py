@@ -62,33 +62,21 @@ def save_state(state):
         print(f"⚠️ 状态写入失败: {e}")
 
 
-def mark_done(state, today, key, status):
-    state["days"].setdefault(today, {})[key] = status
+def mark_done(state, today, key, status, customer_code=None):
+    # 值改为 dict: status + 完整客编, 供跳过行显示; 兼容旧的字符串值
+    state["days"].setdefault(today, {})[key] = {
+        "status": status,
+        "customerCode": customer_code,
+    }
 
 
 # ======== 工具函数 ========
 
 def mask_account(account):
-    """用于打印时隐藏部分账号信息"""
+    """用于打印时隐藏部分账号信息 (仅用于 token, 客编已明文输出)"""
     if len(account) >= 4:
         return account[:2] + '****' + account[-2:]
     return '****'
-
-
-def mask_json_customer_code(data):
-    """递归地脱敏 JSON 中的 customerCode 字段"""
-    if isinstance(data, dict):
-        new_data = {}
-        for k, v in data.items():
-            if k == "customerCode" and isinstance(v, str):
-                new_data[k] = v[:1] + "xxxxx" + v[-2:]
-            else:
-                new_data[k] = mask_json_customer_code(v)
-        return new_data
-    elif isinstance(data, list):
-        return [mask_json_customer_code(i) for i in data]
-    else:
-        return data
 
 
 # ======== 推送通知 ========
@@ -112,11 +100,13 @@ def send_msg_by_server(send_key, title, content):
 
 
 # ======== 单个账号签到逻辑 ========
-# 返回 (status, message):
+# 返回 (status, message, customer_code):
 #   status: ok=今日签到成功 / already=今日已签到 / fail=失败(未记记忆, 下周期重试)
 #   message: 仅 ok 时非空 (推送到 Server 酱的内容)
+#   customer_code: 完整客编, 写入记忆供跳过行显示
 
 def sign_in(access_token, retries=3, backoff=10):
+    customer_code = None  # 首个请求失败时仍未赋值, 先初始化
     headers = {
         'X-JLC-AccessToken': access_token,
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) '
@@ -143,11 +133,11 @@ def sign_in(access_token, retries=3, backoff=10):
             if not sign_result.get('success'):
                 message = sign_result.get('message', '未知错误')
                 if '已经签到' in message:
-                    print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到")
-                    return ("already", None)
+                    print(f"ℹ️ [账号{customer_code}] 今日已签到")
+                    return ("already", None, customer_code)
                 else:
-                    print(f"❌ [账号{mask_account(customer_code)}] 签到失败 - {message}")
-                    return ("fail", None)
+                    print(f"❌ [账号{customer_code}] 签到失败 - {message}")
+                    return ("fail", None, customer_code)
 
             # 解析签到数据
             data = sign_result.get('data', {})
@@ -159,9 +149,10 @@ def sign_in(access_token, retries=3, backoff=10):
             # 处理签到结果
             if status and status > 0:
                 if gain_num is not None and gain_num != 0:
-                    print(f"✅ [账号{mask_account(customer_code)}] 今日签到成功")
+                    print(f"✅ [账号{customer_code}] 今日签到成功")
                     return ("ok",
-                            f"✅ 账号({mask_account(customer_code)})：获取{gain_num}个金豆，当前总数：{integral_voucher + gain_num}")
+                            f"✅ 账号({customer_code})：获取{gain_num}个金豆，当前总数：{integral_voucher + gain_num}",
+                            customer_code)
                 else:
                     # 第七天特殊处理
                     seventh_response = requests.get(seventh_day_url, headers=headers, timeout=15)
@@ -169,15 +160,16 @@ def sign_in(access_token, retries=3, backoff=10):
                     seventh_result = seventh_response.json()
 
                     if seventh_result.get("success"):
-                        print(f"🎉 [账号{mask_account(customer_code)}] 第七天签到成功")
+                        print(f"🎉 [账号{customer_code}] 第七天签到成功")
                         return ("ok",
-                                f"🎉 账号({mask_account(customer_code)})：第七天签到成功，当前金豆总数：{integral_voucher + 8}")
+                                f"🎉 账号({customer_code})：第七天签到成功，当前金豆总数：{integral_voucher + 8}",
+                                customer_code)
                     else:
-                        print(f"ℹ️ [账号{mask_account(customer_code)}] 第七天签到失败，无金豆获取")
-                        return ("already", None)
+                        print(f"ℹ️ [账号{customer_code}] 第七天签到失败，无金豆获取")
+                        return ("already", None, customer_code)
             else:
-                print(f"ℹ️ [账号{mask_account(customer_code)}] 今日已签到或签到失败")
-                return ("already", None)
+                print(f"ℹ️ [账号{customer_code}] 今日已签到或签到失败")
+                return ("already", None, customer_code)
 
         except RequestException as e:
             print(f"⚠️ [账号{mask_account(access_token)}] 第{attempt}次请求失败: {str(e)}")
@@ -187,13 +179,13 @@ def sign_in(access_token, retries=3, backoff=10):
                 time.sleep(wait)
             else:
                 print(f"❌ [账号{mask_account(access_token)}] 已重试 {retries} 次，放弃")
-                return ("fail", None)
+                return ("fail", None, customer_code)
         except KeyError as e:
             print(f"❌ [账号{mask_account(access_token)}] 数据解析失败: 缺少键 {str(e)}")
-            return ("fail", None)
+            return ("fail", None, customer_code)
         except Exception as e:
             print(f"❌ [账号{mask_account(access_token)}] 未知错误: {str(e)}")
-            return ("fail", None)
+            return ("fail", None, customer_code)
 
 
 # ======== 主函数 ========
@@ -246,17 +238,23 @@ def main():
             # 当日已签到 -> 直接跳过, 零请求 (防风控)
             done = state["days"].get(today, {}).get(key)
             if done:
-                print(f"⏭️ [账号{mask_account(token)}] 今日已处理 (记忆: {done}), 跳过")
+                # 兼容旧格式 (值是字符串) 与新格式 (值是 dict 含客编)
+                if isinstance(done, dict):
+                    done_status = done.get("status")
+                    done_code = done.get("customerCode") or mask_account(token)
+                else:
+                    done_status, done_code = done, mask_account(token)
+                print(f"⏭️ [账号{done_code}] 今日已处理 (记忆: {done_status}), 跳过")
                 continue
 
             # 执行签到
-            status, message = sign_in(token)
+            status, message, customer_code = sign_in(token)
             if status == "ok" and message is not None:
                 results.append(message)
 
-            # 成功/已签到 -> 写入当日记忆, 今天再跑直接跳过; 失败不记, 下周期重试
+            # 成功/已签到 -> 写入当日记忆 (含完整客编), 今天再跑跳过行可显示; 失败不记, 下周期重试
             if status in ("ok", "already"):
-                mark_done(state, today, key, status)
+                mark_done(state, today, key, status, customer_code)
                 state_changed = True
 
             # 如果不是最后一个账号，则等待随机时间
